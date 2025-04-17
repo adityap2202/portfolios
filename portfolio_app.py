@@ -9,6 +9,8 @@ import re
 import requests
 import time
 from bs4 import BeautifulSoup
+import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def load_portfolio_data(file):
     """Load and process the portfolio data from Excel file."""
@@ -114,35 +116,50 @@ def get_demat_info(file):
     return info
 
 def fetch_current_price(isin):
-    """Fetch current market price for a given ISIN."""
+    """Fetch current market price for a given ISIN using Yahoo Finance."""
     try:
-        # Using NSE India website to fetch current price
-        # This is a simplified approach and may need adjustments based on actual API availability
-        url = f"https://www.nseindia.com/get-quotes/equity?symbol={isin}"
-        
-        # Add headers to mimic a browser request
+        # First search for the ticker using Yahoo Finance search API
+        search_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={isin}"
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'application/json'
         }
         
-        response = requests.get(url, headers=headers)
-        
+        response = requests.get(search_url, headers=headers)
         if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # This is a simplified approach - actual implementation would depend on the website structure
-            price_element = soup.select_one('.last-price')
-            if price_element:
-                return float(price_element.text.strip().replace(',', ''))
+            data = response.json()
+            quotes = data.get('quotes', [])
+            
+            # Look for NSE ticker in the search results
+            nse_ticker = None
+            for quote in quotes:
+                if quote.get('exchange') == 'NSI' and quote.get('symbol', '').endswith('.NS'):
+                    nse_ticker = quote.get('symbol')
+                    break
+            
+            if nse_ticker:
+                # Get the price using the found ticker
+                stock = yf.Ticker(nse_ticker)
+                current_price = stock.info.get('regularMarketPrice')
+                if current_price:
+                    return current_price
+            
+            # If NSE ticker not found or price not available, try BSE
+            for quote in quotes:
+                if quote.get('exchange') == 'BSE' and quote.get('symbol', '').endswith('.BO'):
+                    bse_ticker = quote.get('symbol')
+                    stock = yf.Ticker(bse_ticker)
+                    current_price = stock.info.get('regularMarketPrice')
+                    if current_price:
+                        return current_price
         
-        # If we can't get the price, return None
         return None
     except Exception as e:
         st.warning(f"Could not fetch price for ISIN {isin}: {str(e)}")
         return None
 
 def get_current_prices(df):
-    """Get current prices for all stocks in the dataframe."""
+    """Get current prices for all stocks in the dataframe using parallel processing."""
     # Create a cache for prices to avoid duplicate API calls
     price_cache = {}
     
@@ -153,27 +170,35 @@ def get_current_prices(df):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Process each row
-    for i, row in df.iterrows():
-        isin = row['ISIN']
-        status_text.text(f"Fetching price for {row['Company Name']} ({isin})...")
+    # Get unique ISINs to avoid duplicate API calls
+    unique_isins = df['ISIN'].unique()
+    total_isins = len(unique_isins)
+    
+    # Create a mapping of ISIN to row indices for faster updates
+    isin_to_rows = {isin: df[df['ISIN'] == isin].index.tolist() for isin in unique_isins}
+    
+    # Process ISINs in parallel
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit all tasks
+        future_to_isin = {executor.submit(fetch_current_price, isin): isin for isin in unique_isins}
         
-        # Check if we already have this price in the cache
-        if isin in price_cache:
-            df.at[i, 'Current Price (Rs.)'] = price_cache[isin]
-        else:
-            # Fetch the current price
-            current_price = fetch_current_price(isin)
+        # Process completed tasks
+        completed = 0
+        for future in as_completed(future_to_isin):
+            isin = future_to_isin[future]
+            try:
+                current_price = future.result()
+                # Update all rows with this ISIN
+                for row_idx in isin_to_rows[isin]:
+                    df.at[row_idx, 'Current Price (Rs.)'] = current_price
+                price_cache[isin] = current_price
+            except Exception as e:
+                st.warning(f"Error fetching price for {isin}: {str(e)}")
             
-            # Store in cache and dataframe
-            price_cache[isin] = current_price
-            df.at[i, 'Current Price (Rs.)'] = current_price
-            
-            # Add a small delay to avoid rate limiting
-            time.sleep(0.0)
-        
-        # Update progress
-        progress_bar.progress((i + 1) / len(df))
+            # Update progress
+            completed += 1
+            progress_bar.progress(completed / total_isins)
+            status_text.text(f"Processed {completed} of {total_isins} stocks")
     
     # Clear the progress indicators
     progress_bar.empty()
