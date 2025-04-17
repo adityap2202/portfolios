@@ -117,18 +117,38 @@ def get_demat_info(file):
 
 def fetch_current_price(isin):
     """Fetch current market price for a given ISIN using Yahoo Finance."""
-    try:
-        # First search for the ticker using Yahoo Finance search API
-        search_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={isin}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'application/json'
-        }
-        
-        response = requests.get(search_url, headers=headers)
-        if response.status_code == 200:
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # First search for the ticker using Yahoo Finance search API
+            search_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={isin}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'application/json'
+            }
+            
+            response = requests.get(search_url, headers=headers)
+            
+            if response.status_code == 429:  # Too Many Requests
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    st.warning(f"Rate limited by Yahoo Finance for ISIN {isin}. Please try again later.")
+                    return None
+            
+            if response.status_code != 200:
+                st.warning(f"Failed to search for ISIN {isin}. Status code: {response.status_code}")
+                return None
+            
             data = response.json()
             quotes = data.get('quotes', [])
+            
+            if not quotes:
+                st.warning(f"No quotes found for ISIN {isin}")
+                return None
             
             # Look for NSE ticker in the search results
             nse_ticker = None
@@ -152,11 +172,19 @@ def fetch_current_price(isin):
                     current_price = stock.info.get('regularMarketPrice')
                     if current_price:
                         return current_price
-        
-        return None
-    except Exception as e:
-        st.warning(f"Could not fetch price for ISIN {isin}: {str(e)}")
-        return None
+            
+            st.warning(f"No price found for ISIN {isin} in either NSE or BSE")
+            return None
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            else:
+                st.warning(f"Error fetching price for ISIN {isin}: {str(e)}")
+                return None
+    
+    return None
 
 def get_current_prices(df):
     """Get current prices for all stocks in the dataframe using parallel processing."""
@@ -177,8 +205,8 @@ def get_current_prices(df):
     # Create a mapping of ISIN to row indices for faster updates
     isin_to_rows = {isin: df[df['ISIN'] == isin].index.tolist() for isin in unique_isins}
     
-    # Process ISINs in parallel
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # Process ISINs in parallel with reduced number of workers to avoid rate limiting
+    with ThreadPoolExecutor(max_workers=3) as executor:
         # Submit all tasks
         future_to_isin = {executor.submit(fetch_current_price, isin): isin for isin in unique_isins}
         
@@ -199,6 +227,10 @@ def get_current_prices(df):
             completed += 1
             progress_bar.progress(completed / total_isins)
             status_text.text(f"Processed {completed} of {total_isins} stocks")
+            
+            # Add a small delay between batches to avoid rate limiting
+            if completed % 5 == 0:  # Every 5 stocks
+                time.sleep(1)
     
     # Clear the progress indicators
     progress_bar.empty()
